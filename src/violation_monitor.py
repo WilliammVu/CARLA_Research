@@ -3,20 +3,20 @@
 # 2025
 
 import carla
-import time, random, sys, math
+import time, random, math
 from datetime import datetime
-from enum import IntEnum
 
 # ViolationMonitor for CARLA Simulator
 # Follows a vehicle for a specified duration of time
 # If the vehicle violates a traffic law, keeps track of that data
 
-# The ViolationMonitor class is a fork/superset of carla.Vehicle
+# The ViolationMonitor class is a manager of carla.Vehicle
+# You need to run it separately from your AV script
 
 # Types of violations:
 #    RedLightViolation
 #    IllegalStopViolation
-#    RunStopSign
+#    RunStopSignViolation
 #    CollisionViolation
 #    SpeedingViolation
 #    SlowViolation
@@ -27,17 +27,18 @@ class Violation:
 
 # If the vehicle runs a red light
 class RedLightViolation (Violation):
-    def __init__(self):
+    def __init__(self, light = None):
         super().__init__()
         self.type_id = 'RedLightViolation'
-        self.junction_id = None
+        self.light:carla.TrafficLight = light
 
 # If the vehicle makes an illegal stop 
 class IllegalStopViolation (Violation): 
-    def __init__(self, transform = None):
+    def __init__(self, transform = None, time_stopped = None):
         super().__init__()
         self.type_id = 'StopViolation'
         self.transform:carla.Transform = transform
+        self.time_stopped:float = time_stopped
 
 # If the vehicle drives faster than the speed limit
 class SpeedingViolation (Violation): # Done
@@ -68,6 +69,7 @@ class CollisionViolation (Violation): # Done
         self.type_id = 'CollisionViolation'
         self.other_actor = other_actor
         self.severity = None
+        impulse = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
         if impulse < 1000:
             self.severity = 'Minor'
         elif impulse < 5000:
@@ -76,12 +78,10 @@ class CollisionViolation (Violation): # Done
             self.severity = 'Severe'
 
 class ViolationMonitor: 
-    def __init__(self, *, host = None, port = None):
+    def __init__(self, *, host = 'localhost', port = 2000, file = None):
         # Carla Simulator essentials
-        if host is None:
-            host = 'localhost'
-        if port is None:
-            port = 2000
+        self.host = host
+        self.port = port
         self.client = carla.Client(host, port)
         self.client.set_timeout(10.0)
         self.world = self.client.get_world()
@@ -90,47 +90,121 @@ class ViolationMonitor:
         self.traffic_manager = self.client.get_trafficmanager()
         self.spectator = self.world.get_spectator()
 
-        # Object Mnagaement
+        # Object Management
         self.actor_list = []
         self.vehicle = None
         self.collision_sensor = None
         self.obstacle_sensor = None
-        self.previous_obstacle_detection = None # Timestamp
-        self.start_time = 0.0
-        self.last_junction_id = None
-        self.last_illegal_stop_location = None
         self.stop_signs = []; self._initialize_stop_signs()
+        self.traffic_lights = []; self._initialize_traffic_lights()
 
+        # Violations
         self.violations = []
 
-    def monitor(self, *, vehicle = None, duration = 300.0):
+        # Duplicate violation prevention
+        self.previous_obstacle_detection = 0.0 
+        self.last_light_run = 0.0 
+        self.last_illegal_stop_transform = None 
+        self.last_slow_time = 0.0
+        self.last_speed_time = 0.0
+        
+        self.file = file
+        if file is not None:
+            with open(self.file, 'w') as file:
+                pass
+
+    def monitor(self, vehicle = None, duration = 300.0):
         # Setup self.vehicle
         if vehicle is None:
             self._spawn_vehicle()
+            self._spawn_sensors()
+            self._activate_sensors()
+            self._enable_autopilot()
         else:
             self.vehicle = vehicle
-            if self.vehicle is None:
-                sys.stderr.write('ViolationMonitor.monitor(): pass a valid vehicle object')
-                sys.exit(1)
-        self._spawn_sensors()
-        self._activate_sensors()
-        self._enable_autopilot(True)
+            self._spawn_sensors()
+            self._activate_sensors()
 
+        # Start monitoring when the vehicle starts moving
         start = time.time()
-
-        while time.time() - start < duration:
-            if self.vehicle.is_at_traffic_light():
-                self._monitor_light_violation()
-
-            sign_bounding_box = self._get_stop_sign()
-            if sign_bounding_box is not None:
-                self._monitor_stop_sign_violation(sign_bounding_box)
-
-            self._monitor_illegal_stop_violation()
-
-            self._monitor_speed_violation()
+        while self._get_speed() < 0.05 or time.time() - start < 1.5:
+            time.sleep(0.1)
         
+        print('started to monitor. Ctrl+C to stop.')
+        while time.time() - start < duration:
+            try:
+                # track light violation while preventing duplicate violation logs
+                if time.time() - self.last_light_run > 5.0 and self.vehicle.is_at_traffic_light():
+                    self._monitor_light_violation()
+
+                sign = self._get_stop_sign()
+                if sign is not None:
+                    self._monitor_stop_sign_violation(sign)
+
+                self._monitor_illegal_stop_violation()
+
+                self._monitor_speed_violation()
+            except KeyboardInterrupt as e:
+                break
+
         self.collision_sensor.stop()
+        self.obstacle_sensor.stop()
+        self._reset()
+
+    def find_vehicle(self):
+        """
+        Find the vehicle 
+        """
+        vehicle = None
+        actors = self.world.get_actors()
+        i = len(actors) - 1
+        while i >= 0: # Iterate backwards since the vehicle was probably just appended to actors
+            if 'vehicle' in actors[i].type_id:
+                vehicle = actors[i]
+                break
+            i -= 1
+        if vehicle is None:
+            print('Couldnt find vehicle')
+        return vehicle
+
+    def _log_violation(self, violation):
+        """
+        Log a violation to file and/or terminal.
+        """
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if isinstance(violation, RedLightViolation):
+            message = f"[{timestamp}] RED LIGHT VIOLATION"
+            
+        elif isinstance(violation, IllegalStopViolation):
+            if violation.transform:
+                loc = violation.transform.location
+                message = f"[{timestamp}] ILLEGAL STOP VIOLATION - Location: ({loc.x:.2f}, {loc.y:.2f}, {loc.z:.2f})"
+            else:
+                message = f"[{timestamp}] ILLEGAL STOP VIOLATION - Location: Unknown"
+                
+        elif isinstance(violation, SpeedingViolation):
+            message = f"[{timestamp}] SPEEDING VIOLATION - Speed: {violation.speed:.1f} km/h (Limit: {violation.limit:.1f} km/h)"
+            
+        elif isinstance(violation, SlowViolation):
+            message = f"[{timestamp}] SLOW DRIVING VIOLATION - Speed: {violation.speed:.1f} km/h (Limit: {violation.limit:.1f} km/h)"
+            
+        elif isinstance(violation, RunStopSignViolation):
+            message = f"[{timestamp}] STOP SIGN VIOLATION"
+            
+        elif isinstance(violation, CollisionViolation):
+            actor_info = violation.other_actor.type_id if violation.other_actor else "Unknown"
+            message = f"[{timestamp}] COLLISION VIOLATION - Other Actor: {actor_info}, Severity: {violation.severity}"
+            
+        else:
+            message = f"[{timestamp}] UNKNOWN VIOLATION - Type: {violation.type_id}"
+        
+        print(message)
+        
+        if self.file is not None:
+            with open(self.file, 'a') as file:
+                file.write(message + '\n')
 
     def _initialize_stop_signs(self):
         actors = self.world.get_actors()
@@ -138,9 +212,16 @@ class ViolationMonitor:
             if 'stop' in actor.type_id:
                 self.stop_signs.append(actor)
 
+    def _initialize_traffic_lights(self):
+        actors = self.world.get_actors()
+        for actor in actors:
+            if actor.type_id == 'traffic.traffic_light':
+                self.traffic_lights.append(actor)
+
     def _spawn_vehicle(self):
         bp = random.choice(self.blueprint_library.filter('vehicle.tesla.model3'))
         sp = random.choice(self.map.get_spawn_points())
+        self.spectator.set_transform(sp)
         vehicle = None
         while vehicle is None:
             vehicle = self.world.try_spawn_actor(bp, sp)
@@ -166,7 +247,6 @@ class ViolationMonitor:
             carla.Transform(carla.Location(0, 0, 0)),
             attach_to=self.vehicle,
             attachment_type=carla.AttachmentType.Rigid,
-            sensor_tick = 0.25 # To reduce computational costs
         )
         self.actor_list.append(self.obstacle_sensor)
 
@@ -181,118 +261,221 @@ class ViolationMonitor:
         Callback function for the collision sensor
         """
         other_actor = event.other_actor
-        impulse = event.impulse
+        impulse = event.normal_impulse
         vi = CollisionViolation(other_actor, impulse)
         self.violations.append(vi)
+        self._log_violation(vi)
 
     def _detect_obstacle(self, event):
         """
         Callback function for the obstacle sensor
         """
-        self.previous_obstacle_detection = event.timestamp
+        if 'static' not in event.other_actor.type_id:
+            self.previous_obstacle_detection = time.time()
+            print(f'detected obstacle: {event.other_actor}')
 
-    def _enable_autopilot(self, foo:bool):
-        if foo:
-            self.traffic_manager.ignore_lights_percentage(self.vehicle, 100)
-            self.vehicle.set_autopilot(True)
-        else:
-            self.traffic_manager.ignore_lights_percentage(self.vehicle, 0)
-            self.vehicle.set_autopilot(False)
+    def _enable_autopilot(self, perc = 100):
+        self.traffic_manager.ignore_signs_percentage(self.vehicle, perc)
+        self.traffic_manager.ignore_lights_percentage(self.vehicle, perc)
+        self.traffic_manager.ignore_vehicles_percentage(self.vehicle, perc)
+        self.traffic_manager.ignore_walkers_percentage(self.vehicle, perc)
+        self.traffic_manager.global_percentage_speed_difference(-50)
+        self.vehicle.set_autopilot(True)
 
     def _monitor_light_violation(self):
         # The vehicle is in a red light affected area at this point
         # If the vehicle's last traffic light state before leaving the area was red,
-        # log a Violtation.RunRedLight
-        # Furthermore, if the vehicle experiences an entire green light cycle before leaving the area,
-        # and there is no obstruction directly in front of it,
-        # log a Violation.FailToGoAtGreen
+        # log a RedLightViolation
+        # Additionally, if the vehicle is ever moving faster than 2 m/s in a red light trigger volume,
+        # log a RedLightViolation
+
+        if time.time() - self.last_light_run < 7.0:
+            return False
+        
+        light = self.vehicle.get_traffic_light()
+        last_red_time = None
 
         currState = None
         while self.vehicle.get_traffic_light() is not None:
             currState = self.vehicle.get_traffic_light_state()
+
+            if self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
+                last_red_time = time.time()
+
             # Check for unnecessary stop
-            if self._monitor_stop_violation():
+            if self._monitor_illegal_stop_violation():
                 return False
-            
+            # Check speed
+            # If self._get_speed() > 2.0 and self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
+                #vi = RedLightViolation(light)
+                #self.violations.append(vi)
+                #self._log_violation(vi)
+                #self.last_light_run = time.time()
+                #return True
+        exit_time = time.time()
+        if last_red_time is not None and exit_time - last_red_time < 0.4:
+            vi = RedLightViolation(light)
+            self.violations.append(vi)
+            self._log_violation(vi)
+            self.last_light_run = time.time()
+            return True
+
         if currState == carla.TrafficLightState.Red:
-            vi = RedLightViolation()
+            vi = RedLightViolation(light)
+            self.violations.append(vi)
+            self._log_violation(vi)
+            self.last_light_run = time.time()
+            return True
         
-    def _monitor_illegal_stop_violation(self):
-        # If a vehicle is stopped illegally for 3 seconds, log an IllegalStopViolation
-        v = self.vehicle.get_velocity()
-        speed = math.sqrt(v.x**2 + v.y**2 + v.z**2)
-
-        stopped = False
-        if speed <= 0.05:
-            stopped = True
-
-        obstacle = False
-        if abs(time.time() - self.previous_obstacle_detection) < 1.0:
-            obstacle = True
-
-        green = False
-        if self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Green:
-            green = True
-
-        if stopped and not obstacle and green and not self._get_stop_sign():
-            time.sleep(3.0)
-            if stopped and not obstacle and green and not self._get_stop_sign():
-                vi = IllegalStopViolation(self.vehicle.get_transform())
-                self.violations.append(vi)
-                return True
         return False
     
+    def _get_speed(self) -> float:
+        v = self.vehicle.get_velocity()
+        speed = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+        return speed
+
+    def _get_light(self) -> carla.TrafficLight:
+        # This process is used in _monitor_illegal_stop_violation()
+        # to avoid the unpredictable nature of carla.Vehicle.get_traffic_light()
+
+        vehicle_trans = self.vehicle.get_transform()
+        vehicle_loc = vehicle_trans.location
+        vehicle_vec = self.vehicle.get_transform().get_forward_vector()
+
+        # Normalize vector
+        vmag = (vehicle_vec.x**2 + vehicle_vec.y**2 + vehicle_vec.z**2) ** 0.5
+        vehicle_vec = carla.Vector3D(vehicle_vec.x/vmag, vehicle_vec.y/vmag, vehicle_vec.z/vmag)
+
+        for traffic_light in self.traffic_lights:
+            if vehicle_loc.distance(traffic_light.get_transform().location) > 20.0:
+                continue
+
+            light_vec = traffic_light.get_transform().get_forward_vector()
+            lmag = (light_vec.x**2 + light_vec.y**2 + light_vec.z**2) ** 0.5
+            light_vec = carla.Vector3D(light_vec.x/lmag, light_vec.y/lmag, light_vec.z/lmag)
+
+            dot = light_vec.x*vehicle_vec.x + light_vec.y*vehicle_vec.y + light_vec.z*vehicle_vec.z
+
+            tol_deg = 10.0
+            tol = -math.cos(math.radians(tol_deg))
+
+            if dot <= tol:
+                return traffic_light
+
+        return None
+
+
+    def _monitor_illegal_stop_violation(self):
+        if self._get_speed() < 0.05:
+            start = time.time()
+            trans = self.vehicle.get_transform()
+
+            if self.last_illegal_stop_transform is not None and trans.location.distance(self.last_illegal_stop_transform.location) < 1.0:
+                return
+            if self._get_stop_sign() is not None:
+                return
+            if self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
+                return
+            if self.vehicle.get_traffic_light() is not None:
+                if self.vehicle.get_traffic_light().state != carla.TrafficLightState.Green:
+                    return
+            light = self._get_light()
+            if light is not None and light.state != carla.TrafficLightState.Green:
+                return
+            if time.time() - self.previous_obstacle_detection < 2.0:
+                return
+
+            while self._get_speed() < 0.05:
+                time.sleep(0.1)
+            
+            vi = IllegalStopViolation(trans, time.time() - start)
+            self._log_violation(vi)
+            self.last_illegal_stop_transform = trans
+    
     def _monitor_speed_violation(self):
-        # If the vehicle is going > 2 km/hr above the speed limit,
+        # If the vehicle is going > 5 km/hr above the speed limit,
         # log a speeding violation
         # If the vehicle is going < half the speed limit with no obstructions in front of it,
         # log a slow violation
 
         limit = self.vehicle.get_speed_limit()
         # speed = magnitude of the velocity vector
-        v = self.vehicle.get_velocity()
-        speed = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+        speed = self._get_speed()
+        speed = speed * 3.6 # m/s --> km/h
 
-        if speed > limit + 2.0:
-            vi = SpeedingViolation(speed,limit)
-            self.violations.append(vi)
-            return
-        if speed < limit / 2:
-            if abs(time.time() - self.previous_obstacle_detection) < 1.0:
+        if time.time() - self.last_speed_time > 10.0:
+            if speed > limit + 5.0:
+                vi = SpeedingViolation(speed,limit)
+                self.violations.append(vi)
+                self._log_violation(vi)
+                self.last_speed_time = time.time()
+                return
+        
+        if time.time() - self.last_slow_time > 10.0:
+            # Check SlowViolation, not counting stops or red lights
+            notRed = self.vehicle.get_traffic_light_state() != carla.TrafficLightState.Red
+            notStopped = speed > 0.05
+            noObstacle = time.time() - self.previous_obstacle_detection > 1.0
+            noStopSign = self._get_stop_sign() == False
+            if speed <= (limit / 2.0) and notStopped and notRed and noObstacle and noStopSign:
                 vi = SlowViolation(speed,limit)
                 self.violations.append(vi)
+                self._log_violation(vi)
+                self.last_slow_time = time.time()
 
-    def _get_stop_sign(self):
-        """
-        Return the stop sign affecting the vehicle
-        """
+    def _get_stop_sign(self) -> carla.TrafficSign:
+        vehicle_location = self.vehicle.get_location()
+        vehicle_forward = self.vehicle.get_transform().get_forward_vector()
+        
         for stop_sign in self.stop_signs:
-            bounding_box = stop_sign.trigger_volume
-            if bounding_box.contains(self.vehicle.get_location(), self.vehicle.get_transform()):
-                return bounding_box
+            distance = vehicle_location.distance(stop_sign.get_location())
+            
+            if distance < 3:
+                return stop_sign
+
+            if distance < 7:
+                to_sign = stop_sign.get_location() - vehicle_location
+                to_sign_normalized = to_sign / (to_sign.length() + 1e-6)
+                
+                dot_product = vehicle_forward.x * to_sign_normalized.x + \
+                            vehicle_forward.y * to_sign_normalized.y + \
+                            vehicle_forward.z * to_sign_normalized.z
+                
+                if dot_product > 0.5:
+                    return stop_sign
+        
         return None
 
-    def _monitor_stop_sign_violation(self, sign_bounding_box):
-        # Right now, the vehicle should be in the bounding box of a stop sign
-        # If the vehicle leaves the bounding box before its velocity turns 0, log a RunStopSignViolation
+    def _monitor_stop_sign_violation(self, sign):
+        # Right now, the vehicle should be coming closer to a stop sign or at one
+        # If the distance between the vehicle and the stop sign starts to increase,
+        # but the vehicle never stopped before that point,
+        # log a RunStopSignViolation
+
         stopped = False
-        while sign_bounding_box.contains(self.vehicle.get_location(), self.vehicle.get_transform()):
-            v = self.vehicle.get_velocity()
-            spd = math.sqrt(v.x**2 + v.y**2 + v.z**2)
-            if spd == 0:
+        prev_distance = self.vehicle.get_location().distance(sign.get_location())
+        time.sleep(0.1)
+        curr_distance = self.vehicle.get_location().distance(sign.get_location())
+        while curr_distance <= prev_distance or curr_distance < 5.0:
+            spd = self._get_speed()
+            if spd <= 0.05:
                 stopped = True
                 break
+
+            prev_distance = curr_distance
+            time.sleep(0.1)
+            curr_distance = self.vehicle.get_location().distance(sign.get_location())
+
         if not stopped:
-            vi = RunStopSignViolation()
+            vi = RunStopSignViolation(sign)
+            self.violations.append(vi)
+            self._log_violation(vi)
 
     def _destroy_actors(self):
         for actor in self.actor_list:
             # For vehicles
             if hasattr(actor, 'set_autopilot'):
                 actor.set_autopilot(False)
-            # For sensors
-            if hasattr(actor, 'stop'):
-                actor.stop()
             actor.destroy()
 
     def _reset(self):
@@ -303,15 +486,11 @@ class ViolationMonitor:
         self.collision_sensor = None
         self.obstacle_sensor = None
         self.previous_obstacle_detection = None # Timestamp
-        self.start_time = 0.0
-        self.last_junction_id = None # To avoid certain duplicate violations
-        self.last_illegal_stop_location = None
-        self.stop_signs = []; self._initialize_stop_signs()
+        self.last_light_id = None # To avoid duplicate red light violations
+        self.last_illegal_stop_transform = None
+        self.stop_signs = []
 
         self.violations = []
 
 if __name__ == '__main__':
     pass
-    # Not sure how I want this to look yet
-    # I want it to be a fork/superset of carla.Vehicle
-    # So a vehicle but with the monitor() function
