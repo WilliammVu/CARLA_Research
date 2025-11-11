@@ -63,7 +63,7 @@ class RunStopSignViolation (Violation):
         self.stop_sign = stop_sign
 
 # If the vehicle collides with another actor or landmark
-class CollisionViolation (Violation): # Done
+class CollisionViolation (Violation):
     def __init__(self, other_actor = None, impulse = None):
         super().__init__()
         self.type_id = 'CollisionViolation'
@@ -113,7 +113,7 @@ class ViolationMonitor:
             with open(self.file, 'w') as file:
                 pass
 
-    def monitor(self, vehicle = None, duration = 300.0):
+    def monitor(self, *, vehicle = None, duration = 300.0):
         # Setup self.vehicle
         if vehicle is None:
             self._spawn_vehicle()
@@ -127,7 +127,7 @@ class ViolationMonitor:
 
         # Start monitoring when the vehicle starts moving
         start = time.time()
-        while self._get_speed() < 0.05 or time.time() - start < 1.5:
+        while self._get_speed() < 0.05 and time.time() - start < 2.0:
             time.sleep(0.1)
         
         print('started to monitor. Ctrl+C to stop.')
@@ -135,6 +135,7 @@ class ViolationMonitor:
             try:
                 # track light violation while preventing duplicate violation logs
                 if time.time() - self.last_light_run > 5.0 and self.vehicle.is_at_traffic_light():
+                    print('In Light Bounding Box, calling check')
                     self._monitor_light_violation()
 
                 sign = self._get_stop_sign()
@@ -284,10 +285,6 @@ class ViolationMonitor:
 
     def _monitor_light_violation(self):
         # The vehicle is in a red light affected area at this point
-        # If the vehicle's last traffic light state before leaving the area was red,
-        # log a RedLightViolation
-        # Additionally, if the vehicle is ever moving faster than 2 m/s in a red light trigger volume,
-        # log a RedLightViolation
 
         if time.time() - self.last_light_run < 7.0:
             return False
@@ -305,15 +302,9 @@ class ViolationMonitor:
             # Check for unnecessary stop
             if self._monitor_illegal_stop_violation():
                 return False
-            # Check speed
-            # If self._get_speed() > 2.0 and self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
-                #vi = RedLightViolation(light)
-                #self.violations.append(vi)
-                #self._log_violation(vi)
-                #self.last_light_run = time.time()
-                #return True
+
         exit_time = time.time()
-        if last_red_time is not None and exit_time - last_red_time < 0.4:
+        if last_red_time is not None and exit_time - last_red_time < 0.3:
             vi = RedLightViolation(light)
             self.violations.append(vi)
             self._log_violation(vi)
@@ -364,7 +355,6 @@ class ViolationMonitor:
 
         return None
 
-
     def _monitor_illegal_stop_violation(self):
         if self._get_speed() < 0.05:
             start = time.time()
@@ -377,7 +367,7 @@ class ViolationMonitor:
             if self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
                 return
             if self.vehicle.get_traffic_light() is not None:
-                if self.vehicle.get_traffic_light().state != carla.TrafficLightState.Green:
+                if self.vehicle.get_traffic_light().get_state() != carla.TrafficLightState.Green:
                     return
             light = self._get_light()
             if light is not None and light.state != carla.TrafficLightState.Green:
