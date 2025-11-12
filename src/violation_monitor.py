@@ -113,17 +113,29 @@ class ViolationMonitor:
             with open(self.file, 'w') as file:
                 pass
 
-    def monitor(self, *, vehicle = None, duration = 300.0):
+    def monitor(self, *, vehicle = None, vehicle_id = None, duration = 300.0):
         # Setup self.vehicle
-        if vehicle is None:
+        if vehicle is not None:
+            self.vehicle = vehicle
+            self._spawn_sensors()
+            self._activate_sensors()
+        elif vehicle_id is not None:
+            found = False
+            for actor in self.world.get_actors():
+                if actor.id == vehicle_id:
+                    self.vehicle = vehicle
+                    self._spawn_sensors()
+                    self._activate_sensors()
+                    found = True
+                    break
+            if not found:
+                print('Could not find vehicle to monitor based on the vehicle ID provided.')
+                return
+        else:
             self._spawn_vehicle()
             self._spawn_sensors()
             self._activate_sensors()
             self._enable_autopilot()
-        else:
-            self.vehicle = vehicle
-            self._spawn_sensors()
-            self._activate_sensors()
 
         # Start monitoring when the vehicle starts moving
         start = time.time()
