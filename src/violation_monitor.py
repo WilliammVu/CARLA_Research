@@ -134,8 +134,7 @@ class ViolationMonitor:
         while time.time() - start < duration:
             try:
                 # track light violation while preventing duplicate violation logs
-                if time.time() - self.last_light_run > 5.0 and self.vehicle.is_at_traffic_light():
-                    print('In Light Bounding Box, calling check')
+                if time.time() - self.last_light_run > 4.0 and self.vehicle.is_at_traffic_light():
                     self._monitor_light_violation()
 
                 sign = self._get_stop_sign()
@@ -151,22 +150,6 @@ class ViolationMonitor:
         self.collision_sensor.stop()
         self.obstacle_sensor.stop()
         self._reset()
-
-    def find_vehicle(self):
-        """
-        Find the vehicle 
-        """
-        vehicle = None
-        actors = self.world.get_actors()
-        i = len(actors) - 1
-        while i >= 0: # Iterate backwards since the vehicle was probably just appended to actors
-            if 'vehicle' in actors[i].type_id:
-                vehicle = actors[i]
-                break
-            i -= 1
-        if vehicle is None:
-            print('Couldnt find vehicle')
-        return vehicle
 
     def _log_violation(self, violation):
         """
@@ -273,7 +256,6 @@ class ViolationMonitor:
         """
         if 'static' not in event.other_actor.type_id:
             self.previous_obstacle_detection = time.time()
-            print(f'detected obstacle: {event.other_actor}')
 
     def _enable_autopilot(self, perc = 100):
         self.traffic_manager.ignore_signs_percentage(self.vehicle, perc)
@@ -471,16 +453,21 @@ class ViolationMonitor:
     def _reset(self):
         self._destroy_actors()
         
+        # Object Management
         self.actor_list = []
         self.vehicle = None
         self.collision_sensor = None
         self.obstacle_sensor = None
-        self.previous_obstacle_detection = None # Timestamp
-        self.last_light_id = None # To avoid duplicate red light violations
-        self.last_illegal_stop_transform = None
-        self.stop_signs = []
 
+        # Violations
         self.violations = []
+
+        # Duplicate violation prevention
+        self.previous_obstacle_detection = 0.0 
+        self.last_light_run = 0.0 
+        self.last_illegal_stop_transform = None 
+        self.last_slow_time = 0.0
+        self.last_speed_time = 0.0
 
 if __name__ == '__main__':
     pass
